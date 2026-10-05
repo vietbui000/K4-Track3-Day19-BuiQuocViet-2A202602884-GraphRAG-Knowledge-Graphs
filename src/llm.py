@@ -2,7 +2,7 @@
 
 Providers (pick with env vars, otherwise the first one in PROVIDER_ORDER that has an API key wins):
 
-    LLM_PROVIDER        = openai | openrouter | gemini | anthropic    (chat)
+    LLM_PROVIDER        = openai | openrouter | gemini | anthropic | groq    (chat)
     EMBEDDING_PROVIDER  = openai | openrouter | gemini                (Anthropic has no embedding API)
     <PROVIDER>_CHAT_MODEL / <PROVIDER>_EMBEDDING_MODEL override the default models below.
 
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import time
 from dataclasses import dataclass, fields
 from typing import Any
@@ -24,19 +25,23 @@ PROVIDERS = {
                    "chat": "openai/gpt-4o-mini", "embed": "openai/text-embedding-3-small"},
     "gemini": {"key": "GEMINI_API_KEY", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
                "chat": "gemini-2.5-flash-lite", "embed": "gemini-embedding-001"},
+    "groq": {"key": "GROQ_API_KEY", "base_url": "https://api.groq.com/openai/v1",
+             "chat": "openai/gpt-oss-120b", "embed": None},
     "anthropic": {"key": "ANTHROPIC_API_KEY", "base_url": None,
                   "chat": "claude-opus-5-5", "embed": None},
 }
-PROVIDER_ORDER = ["openai", "openrouter", "gemini", "anthropic"]
+PROVIDER_ORDER = ["openai", "openrouter", "gemini", "anthropic", "groq"]
 
 # USD per 1M tokens (input, output). Check each provider's pricing page before reporting real numbers.
 PRICES_PER_M = {
     "gpt-4o-mini": (0.15, 0.60),
+    "gpt-oss-120b": (0.15, 0.60),
     "gpt-4.1-mini": (0.40, 1.60),
     "gpt-4.1-nano": (0.10, 0.40),
     "text-embedding-3-small": (0.02, 0.0),
     "text-embedding-3-large": (0.13, 0.0),
     "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-3.5-flash-lite": (0.30, 2.50),   # ai.google.dev/gemini-api/docs/pricing, paid tier, checked 2026-10-05
     # Gemini embedding pricing intentionally omitted: the current pricing page does not list gemini-embedding-001.
     "claude-opus-5-5": (4.00, 20.00),
     "claude-sonnet-5-5": (2.00, 10.00),
@@ -85,6 +90,24 @@ def _strip_fences(text: str) -> str:
         text = text.rsplit("```", 1)[0]
     return text.strip()
 
+MAX_RETRIES = 8
+RETRY_STATUS = {429, 500, 502, 503, 504}   # rate limit + transient server errors (e.g. Groq "over capacity")
+
+def _with_retry(call: Any, what: str) -> Any:
+    """Free tiers (Gemini: 100 embeddings/min, Groq: tokens/min, capacity) fail in bursts: back off, then retry."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return call()
+        except Exception as err:
+            status = getattr(err, "status_code", None)
+            if status not in RETRY_STATUS or attempt == MAX_RETRIES:
+                raise
+            hint = re.search(r"(?:retry in|try again in) ([\d.]+)s", str(err), re.IGNORECASE)
+            wait = float(hint.group(1)) + 1 if hint else min(5 * 2 ** (attempt - 1), 60)   # 5, 10, 20, 40, 60…
+            reason = "rate limit" if status == 429 else f"server {status}"
+            print(f"[{reason}] {what}: chờ {wait:.0f}s rồi thử lại ({attempt}/{MAX_RETRIES - 1})", flush=True)
+            time.sleep(wait)
+
 def _openai_client(provider: str):
     from openai import OpenAI
 
@@ -120,18 +143,18 @@ class MeteredLLM:
             text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
         else:
             if json_mode and self.chat_provider != "gemini":
-                response = self._chat_client.chat.completions.create(
+                response = _with_retry(lambda: self._chat_client.chat.completions.create(
                     model=self.chat_model_id,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0,
                     response_format={"type": "json_object"},
-                )
+                ), "chat")
             else:
-                response = self._chat_client.chat.completions.create(
+                response = _with_retry(lambda: self._chat_client.chat.completions.create(
                     model=self.chat_model_id,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0,
-                )
+                ), "chat")
             text, model = response.choices[0].message.content or "", self.chat_model_id
             usage = response.usage
             tokens_in = usage.prompt_tokens if usage else 0
@@ -158,7 +181,8 @@ class MeteredLLM:
 
     def embed(self, text: str) -> list[float]:
         start = time.perf_counter()
-        response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+        response = _with_retry(lambda: self._embed_client.embeddings.create(model=self.embed_model_id, input=text),
+                               "embedding")
         tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
         self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
         return [float(value) for value in response.data[0].embedding]
